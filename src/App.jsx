@@ -12,6 +12,7 @@ const STORAGE_KEYS = {
   TRANSACTIONS: 'qurban-transactions',
   SETTINGS: 'qurban-settings',
   CONFIRMATIONS: 'qurban-confirmations',
+  GROUP_OVERRIDES: 'qurban-group-overrides',
 };
 
 const DEFAULT_SETTINGS = {
@@ -67,19 +68,33 @@ function resolveTarget(member, settings) {
   if (animal) return animal.price;
   return settings.targetDefault;
 }
-function computeGroups(members, settings) {
+function computeGroups(members, settings, groupOverrides = {}) {
   const types = (settings.animalTypes || []).filter((a) => (a.quota || 1) > 1);
   return types.map((type) => {
-    const assigned = Object.entries(members)
+    const allForType = Object.entries(members)
       .filter(([, m]) => m.animalId === type.id)
       .map(([id, m]) => ({ id, ...m }))
       .sort((a, b) => (a.joinDate || '').localeCompare(b.joinDate || '') || a.id.localeCompare(b.id));
+
+    const override = groupOverrides[type.id];
+    if (override && override.groups) {
+      // Manual mode — resolve member IDs → objects, filter deleted
+      const groups = override.groups.map((grp) =>
+        grp.map((id) => members[id] ? { id, ...members[id] } : null).filter(Boolean)
+      ).filter((g) => g.length > 0 || override.groups.length === 1);
+      // Unassigned = in allForType but not in any group
+      const assignedIds = new Set(override.groups.flat());
+      const unassigned = allForType.filter((m) => !assignedIds.has(m.id));
+      return { type, groups, unassigned, isManual: true };
+    }
+
+    // Auto mode
     const quota = type.quota || 7;
     const groups = [];
-    for (let i = 0; i < assigned.length; i += quota) {
-      groups.push(assigned.slice(i, i + quota));
+    for (let i = 0; i < allForType.length; i += quota) {
+      groups.push(allForType.slice(i, i + quota));
     }
-    return { type, groups };
+    return { type, groups, unassigned: [], isManual: false };
   });
 }
 async function safeGet(key, shared) {
@@ -827,6 +842,212 @@ function ResetPinModal({ memberName, onClose, onSave }) {
   );
 }
 
+function GroupEditorModal({ type, members, currentOverride, balanceFor, onClose, onSave }) {
+  // Local editable state: array of arrays of member IDs
+  const allForType = Object.entries(members)
+    .filter(([, m]) => m.animalId === type.id)
+    .map(([id, m]) => ({ id, ...m }))
+    .sort((a, b) => (a.joinDate || '').localeCompare(b.joinDate || '') || a.id.localeCompare(b.id));
+
+  const initGroups = () => {
+    if (currentOverride?.groups?.length) {
+      return currentOverride.groups.map((g) => [...g]);
+    }
+    // Auto-seed from quota
+    const quota = type.quota || 7;
+    const res = [];
+    const ids = allForType.map((m) => m.id);
+    for (let i = 0; i < ids.length; i += quota) res.push(ids.slice(i, i + quota));
+    return res.length ? res : [[]];
+  };
+
+  const [groups, setGroups] = useState(initGroups);
+  const [groupNames, setGroupNames] = useState(() => {
+    if (currentOverride?.names) return [...currentOverride.names];
+    const auto = initGroups();
+    return auto.map((_, i) => `Kelompok ${i + 1}`);
+  });
+  const [dragInfo, setDragInfo] = useState(null); // { memberId }
+
+  const assignedIds = new Set(groups.flat());
+  const unassigned = allForType.filter((m) => !assignedIds.has(m.id));
+
+  function addGroup() {
+    setGroups((g) => [...g, []]);
+    setGroupNames((n) => [...n, `Kelompok ${groups.length + 1}`]);
+  }
+  function removeGroup(gi) {
+    // Move members back to unassigned (effectively)
+    const newGroups = groups.filter((_, i) => i !== gi);
+    const newNames = groupNames.filter((_, i) => i !== gi);
+    setGroups(newGroups.length ? newGroups : [[]]);
+    setGroupNames(newNames.length ? newNames : ['Kelompok 1']);
+  }
+  function moveMember(memberId, toGroup) {
+    setGroups((prev) => {
+      const next = prev.map((g) => g.filter((id) => id !== memberId));
+      if (toGroup !== null && toGroup >= 0 && toGroup < next.length) {
+        next[toGroup] = [...next[toGroup], memberId];
+      }
+      return next;
+    });
+  }
+  function renameGroup(gi, name) {
+    setGroupNames((prev) => prev.map((n, i) => i === gi ? name : n));
+  }
+  function handleSave() {
+    // Filter empty groups unless there's only one
+    const cleaned = groups.length > 1 ? groups.filter((g) => g.length > 0) : groups;
+    const cleanedNames = cleaned.map((_, i) => groupNames[i] || `Kelompok ${i + 1}`);
+    onSave({ groups: cleaned, names: cleanedNames });
+  }
+
+  const chipCls = 'flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-stone-200 bg-stone-50 text-xs text-stone-700 cursor-grab select-none';
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-end sm:items-center justify-center z-50 p-0 sm:p-4">
+      <div className="bg-white w-full sm:max-w-lg rounded-t-2xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[90vh]">
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 pt-5 pb-4 border-b border-stone-100 shrink-0">
+          <div>
+            <h3 className="font-semibold text-stone-900" style={headFont}>
+              {animalEmoji(type.name)} Edit Kelompok — {type.name}
+            </h3>
+            <p className="text-xs text-stone-400 mt-0.5">Atur kelompok patungan secara manual</p>
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-stone-100 text-stone-400"><X size={18}/></button>
+        </div>
+
+        {/* Scrollable body */}
+        <div className="overflow-y-auto flex-1 px-5 py-4 space-y-4">
+
+          {/* Groups */}
+          {groups.map((grp, gi) => (
+            <div key={gi} className="border border-stone-200 rounded-xl p-3 space-y-2">
+              {/* Group header */}
+              <div className="flex items-center gap-2">
+                <input
+                  value={groupNames[gi] || ''}
+                  onChange={(e) => renameGroup(gi, e.target.value)}
+                  className="flex-1 text-sm font-medium text-stone-800 bg-transparent border-b border-dashed border-stone-300 focus:outline-none focus:border-blue-500 py-0.5"
+                  placeholder={`Kelompok ${gi + 1}`}
+                />
+                <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${grp.length >= type.quota ? 'bg-blue-100 text-blue-700' : 'bg-amber-100 text-amber-700'}`}>
+                  {grp.length}/{type.quota}
+                </span>
+                {groups.length > 1 && (
+                  <button onClick={() => removeGroup(gi)} title="Hapus kelompok" className="p-1 rounded-lg hover:bg-red-50 text-red-400 shrink-0">
+                    <Trash2 size={14}/>
+                  </button>
+                )}
+              </div>
+
+              {/* Members in this group */}
+              <div className="flex flex-wrap gap-1.5 min-h-[36px]">
+                {grp.length === 0 && (
+                  <p className="text-xs text-stone-300 italic py-1">Belum ada anggota</p>
+                )}
+                {grp.map((memberId) => {
+                  const m = members[memberId];
+                  if (!m) return null;
+                  return (
+                    <div key={memberId} className={chipCls}>
+                      <span>{m.name}</span>
+                      <span className="text-stone-400">·</span>
+                      <span className="text-blue-600">{formatRupiah(balanceFor(memberId))}</span>
+                      {/* Move buttons */}
+                      {groups.length > 1 && (
+                        <div className="flex gap-0.5 ml-1">
+                          {groups.map((_, ti) => ti !== gi && (
+                            <button
+                              key={ti}
+                              onClick={() => moveMember(memberId, ti)}
+                              title={`Pindah ke ${groupNames[ti] || `Kelompok ${ti + 1}`}`}
+                              className="w-5 h-5 rounded bg-blue-100 text-blue-700 text-[10px] font-bold hover:bg-blue-200 flex items-center justify-center transition"
+                            >
+                              {ti + 1}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      <button onClick={() => moveMember(memberId, null)} title="Keluarkan dari kelompok" className="ml-0.5 text-red-400 hover:text-red-600">
+                        <X size={12}/>
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Add unassigned to this group */}
+              {unassigned.length > 0 && (
+                <div className="flex flex-wrap gap-1 pt-1 border-t border-stone-50">
+                  <span className="text-[11px] text-stone-400 w-full">Tambahkan ke kelompok ini:</span>
+                  {unassigned.map((m) => (
+                    <button
+                      key={m.id}
+                      onClick={() => moveMember(m.id, gi)}
+                      className="px-2 py-1 rounded-lg border border-dashed border-blue-300 text-xs text-blue-600 hover:bg-blue-50 transition"
+                    >
+                      + {m.name}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+
+          {/* Unassigned members */}
+          {unassigned.length > 0 && (
+            <div className="border border-dashed border-stone-200 rounded-xl p-3 space-y-2">
+              <p className="text-xs font-medium text-stone-500">Belum dikelompokkan ({unassigned.length} orang)</p>
+              <div className="flex flex-wrap gap-1.5">
+                {unassigned.map((m) => (
+                  <div key={m.id} className={chipCls + ' border-dashed opacity-70'}>
+                    <span>{m.name}</span>
+                    <div className="flex gap-0.5 ml-1">
+                      {groups.map((_, gi) => (
+                        <button
+                          key={gi}
+                          onClick={() => moveMember(m.id, gi)}
+                          title={`Masukkan ke ${groupNames[gi] || `Kelompok ${gi + 1}`}`}
+                          className="w-5 h-5 rounded bg-blue-100 text-blue-700 text-[10px] font-bold hover:bg-blue-200 flex items-center justify-center transition"
+                        >
+                          {gi + 1}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Add group button */}
+          <button onClick={addGroup} className="w-full py-2.5 rounded-xl border border-dashed border-blue-300 text-blue-600 text-sm font-medium flex items-center justify-center gap-2 hover:bg-blue-50 transition">
+            <Plus size={15}/> Tambah Kelompok Baru
+          </button>
+        </div>
+
+        {/* Footer actions */}
+        <div className="px-5 py-4 border-t border-stone-100 flex gap-2 shrink-0">
+          <button
+            onClick={() => onSave(null)}
+            className="px-4 py-2.5 rounded-xl bg-stone-100 text-stone-600 text-sm font-medium hover:bg-stone-200 transition"
+          >
+            Reset Otomatis
+          </button>
+          <button onClick={onClose} className="px-4 py-2.5 rounded-xl bg-stone-100 text-stone-600 text-sm font-medium hover:bg-stone-200 transition">
+            Batal
+          </button>
+          <button onClick={handleSave} className="flex-1 py-2.5 rounded-xl bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 transition">
+            Simpan Kelompok
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function LoginScreen({ members, settings, onLogin }) {
   const [tab, setTab] = useState('member');
   const [phone, setPhone] = useState('');
@@ -939,28 +1160,86 @@ function LoginScreen({ members, settings, onLogin }) {
   );
 }
 
-function MemberDashboard({ memberId, member, transactions, balance, settings, confirmations, onSubmitConfirmation, onLogout }) {
+function ChangePinModal({ member, onClose, onSave }) {
+  const [oldPin, setOldPin] = useState('');
+  const [newPin, setNewPin] = useState('');
+  const [confirmPin, setConfirmPin] = useState('');
+  const [err, setErr] = useState('');
+  const [success, setSuccess] = useState(false);
+
+  function handleSave() {
+    if (oldPin.trim() !== member.pin) { setErr('PIN lama salah.'); return; }
+    if (newPin.trim().length < 4) { setErr('PIN baru minimal 4 digit.'); return; }
+    if (newPin.trim() !== confirmPin.trim()) { setErr('Konfirmasi PIN tidak cocok.'); return; }
+    onSave(newPin.trim());
+    setSuccess(true);
+    setErr('');
+    setTimeout(onClose, 1200);
+  }
+
+  return (
+    <ModalShell title="Ganti PIN" onClose={onClose}>
+      {success ? (
+        <div className="flex flex-col items-center gap-2 py-4">
+          <CheckCircle2 size={40} className="text-blue-500" />
+          <p className="text-sm font-medium text-stone-700">PIN berhasil diganti!</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <Field label="PIN Lama">
+            <input type="password" inputMode="numeric" value={oldPin} onChange={(e) => setOldPin(e.target.value.replace(/\D/g,''))} placeholder="••••" className={inputCls} />
+          </Field>
+          <Field label="PIN Baru">
+            <input type="password" inputMode="numeric" value={newPin} onChange={(e) => setNewPin(e.target.value.replace(/\D/g,''))} placeholder="4-6 digit" className={inputCls} />
+          </Field>
+          <Field label="Konfirmasi PIN Baru">
+            <input type="password" inputMode="numeric" value={confirmPin} onChange={(e) => setConfirmPin(e.target.value.replace(/\D/g,''))} placeholder="ulangi PIN baru" className={inputCls} />
+          </Field>
+          {err && <p className="text-xs text-red-500 flex items-center gap-1"><AlertCircle size={14}/>{err}</p>}
+          <button onClick={handleSave} className="w-full py-2.5 rounded-xl bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 transition">
+            Simpan PIN Baru
+          </button>
+        </div>
+      )}
+    </ModalShell>
+  );
+}
+
+function MemberDashboard({ memberId, member, transactions, balance, settings, confirmations, onSubmitConfirmation, onChangePin, onLogout }) {
   const target = resolveTarget(member, settings);
   const animal = (settings.animalTypes || []).find((a) => a.id === member.animalId);
   const progress = target > 0 ? Math.min(100, (balance / target) * 100) : 0;
   const sorted = [...transactions].sort((a, b) => new Date(b.date) - new Date(a.date));
   const myConfirmations = [...(confirmations || [])].sort((a, b) => b.createdAt - a.createdAt);
+
+  const [menuTab, setMenuTab] = useState('home');
   const [showConfirm, setShowConfirm] = useState(false);
+  const [showChangePin, setShowChangePin] = useState(false);
 
   const statusBadge = {
-    pending: { label: 'Menunggu Verifikasi', cls: 'bg-amber-100 text-amber-700' },
-    approved: { label: 'Diterima', cls: 'bg-blue-100 text-blue-700' },
-    rejected: { label: 'Ditolak', cls: 'bg-red-100 text-red-600' },
+    pending:  { label: 'Menunggu Verifikasi', cls: 'bg-amber-100 text-amber-700' },
+    approved: { label: 'Diterima',            cls: 'bg-blue-100 text-blue-700'  },
+    rejected: { label: 'Ditolak',             cls: 'bg-red-100 text-red-600'    },
   };
+
+  const pendingCount = myConfirmations.filter((c) => c.status === 'pending').length;
+
+  const navItems = [
+    { key: 'home',        label: 'Beranda',   icon: Wallet },
+    { key: 'setoran',     label: 'Setoran',   icon: Calendar },
+    { key: 'konfirmasi',  label: 'Konfirmasi',icon: Inbox, badge: pendingCount },
+    { key: 'akun',        label: 'Akun',      icon: Settings },
+  ];
 
   return (
     <div className="min-h-screen bg-blue-50">
       <FontImport />
       <div className="no-print">
+        {/* Header */}
         <header className="bg-white border-b border-stone-100 px-4 py-4 flex items-center justify-between sticky top-0 z-10">
           <div className="flex items-center gap-2.5">
             <div className="w-9 h-9 rounded-xl bg-stone-100 border border-stone-200 flex items-center justify-center overflow-hidden shrink-0">
-              {settings.logoUrl ? <img src={settings.logoUrl} alt="" className="w-full h-full object-cover" /> : <Wallet size={16} className="text-blue-600" />}
+              {settings.logoUrl ? <img src={settings.logoUrl} alt="" className="w-full h-full object-cover"/> : <Wallet size={16} className="text-blue-600"/>}
             </div>
             <div>
               <p className="text-xs text-stone-400">{settings.namaProgram}</p>
@@ -969,88 +1248,232 @@ function MemberDashboard({ memberId, member, transactions, balance, settings, co
           </div>
           <div className="flex items-center gap-1">
             <button onClick={() => window.print()} title="Cetak" className="p-2 rounded-lg text-stone-500 hover:text-blue-600 hover:bg-blue-50 transition">
-              <Printer size={17} />
+              <Printer size={17}/>
             </button>
             <button onClick={() => exportMemberExcel(settings, member, transactions, balance)} title="Unduh Excel" className="p-2 rounded-lg text-stone-500 hover:text-blue-600 hover:bg-blue-50 transition">
-              <Download size={17} />
+              <Download size={17}/>
             </button>
             <button onClick={onLogout} className="flex items-center gap-1.5 text-sm text-stone-500 hover:text-red-500 transition px-3 py-1.5 rounded-lg hover:bg-red-50 ml-1">
-              <LogOut size={15} /> Keluar
+              <LogOut size={15}/> Keluar
             </button>
           </div>
         </header>
 
-        <main className="p-4 max-w-md mx-auto space-y-4">
-          <div className="bg-gradient-to-br from-blue-600 to-blue-800 rounded-2xl p-5 text-white shadow-lg">
-            <div className="flex items-center justify-between">
-              <p className="text-blue-100 text-xs mb-1">Saldo Tabungan Qurban</p>
-              {animal && (
-                <span className="text-xs bg-white/15 rounded-full px-2.5 py-1">{animalEmoji(animal.name)} {animal.name}</span>
+        {/* Content */}
+        <main className="p-4 pb-24 max-w-md mx-auto space-y-4">
+
+          {/* ── BERANDA ── */}
+          {menuTab === 'home' && (
+            <>
+              {/* Saldo card */}
+              <div className="bg-gradient-to-br from-blue-600 to-blue-800 rounded-2xl p-5 text-white shadow-lg">
+                <div className="flex items-center justify-between">
+                  <p className="text-blue-100 text-xs mb-1">Saldo Tabungan Qurban</p>
+                  {animal && <span className="text-xs bg-white/15 rounded-full px-2.5 py-1">{animalEmoji(animal.name)} {animal.name}</span>}
+                </div>
+                <p className="text-3xl font-bold tracking-tight" style={headFont}>{formatRupiah(balance)}</p>
+                <div className="mt-4">
+                  <div className="flex justify-between text-xs text-blue-100 mb-1">
+                    <span>Target {formatRupiah(target)}</span>
+                    <span>{progress.toFixed(0)}%</span>
+                  </div>
+                  <div className="h-2 bg-blue-800/40 rounded-full overflow-hidden">
+                    <div className="h-full bg-amber-400 rounded-full transition-all" style={{width:`${progress}%`}}/>
+                  </div>
+                </div>
+              </div>
+
+              {/* Konfirmasi pembayaran CTA */}
+              <button
+                onClick={() => setShowConfirm(true)}
+                className="w-full py-3 rounded-xl bg-white border border-blue-200 text-blue-700 text-sm font-medium flex items-center justify-center gap-2 hover:bg-blue-50 transition shadow-sm"
+              >
+                <MessageCircle size={17}/> Konfirmasi Pembayaran ke Admin
+              </button>
+
+              {/* Ringkasan cepat 2 transaksi terakhir */}
+              {sorted.length > 0 && (
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <h2 className="text-sm font-medium text-stone-700">Setoran Terakhir</h2>
+                    <button onClick={() => setMenuTab('setoran')} className="text-xs text-blue-600 hover:underline">Lihat semua</button>
+                  </div>
+                  <div className="bg-white rounded-xl border border-stone-100 divide-y divide-stone-50">
+                    {sorted.slice(0, 2).map((t) => (
+                      <div key={t.id} className="px-4 py-3 flex items-center justify-between">
+                        <div>
+                          <p className="text-sm text-stone-800">{formatDate(t.date)}</p>
+                          {t.note && <p className="text-xs text-stone-400">{t.note}</p>}
+                        </div>
+                        <p className={`text-sm font-medium ${t.type === 'tarik' ? 'text-red-500' : 'text-blue-600'}`}>
+                          {t.type === 'tarik' ? '-' : '+'}{formatRupiah(t.amount)}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+
+          {/* ── RIWAYAT SETORAN ── */}
+          {menuTab === 'setoran' && (
+            <div>
+              <h2 className="text-sm font-medium text-stone-700 mb-2 flex items-center gap-1.5"><Calendar size={15}/> Riwayat Setoran</h2>
+              {sorted.length === 0 ? (
+                <div className="bg-white rounded-xl border border-stone-100 p-8 text-center text-sm text-stone-400">
+                  Belum ada riwayat setoran.
+                </div>
+              ) : (
+                <div className="bg-white rounded-xl border border-stone-100 divide-y divide-stone-50">
+                  {sorted.map((t) => (
+                    <div key={t.id} className="px-4 py-3 flex items-center justify-between">
+                      <div>
+                        <p className="text-sm text-stone-800">{formatDate(t.date)}</p>
+                        {t.note && <p className="text-xs text-stone-400">{t.note}</p>}
+                      </div>
+                      <p className={`text-sm font-medium ${t.type === 'tarik' ? 'text-red-500' : 'text-blue-600'}`}>
+                        {t.type === 'tarik' ? '-' : '+'}{formatRupiah(t.amount)}
+                      </p>
+                    </div>
+                  ))}
+                </div>
               )}
             </div>
-            <p className="text-3xl font-bold tracking-tight" style={headFont}>{formatRupiah(balance)}</p>
-            <div className="mt-4">
-              <div className="flex justify-between text-xs text-blue-100 mb-1">
-                <span>Target {formatRupiah(target)}</span>
-                <span>{progress.toFixed(0)}%</span>
-              </div>
-              <div className="h-2 bg-blue-800/40 rounded-full overflow-hidden">
-                <div className="h-full bg-amber-400 rounded-full transition-all" style={{ width: `${progress}%` }} />
-              </div>
-            </div>
-          </div>
+          )}
 
-          <button
-            onClick={() => setShowConfirm(true)}
-            className="w-full py-3 rounded-xl bg-white border border-blue-200 text-blue-700 text-sm font-medium flex items-center justify-center gap-2 hover:bg-blue-50 transition shadow-sm"
-          >
-            <MessageCircle size={17} /> Konfirmasi Pembayaran ke Admin
-          </button>
-
-          <div>
-            <h2 className="text-sm font-medium text-stone-700 mb-2 flex items-center gap-1.5"><Calendar size={15} /> Riwayat Setoran</h2>
-            {sorted.length === 0 ? (
-              <div className="bg-white rounded-xl border border-stone-100 p-6 text-center text-sm text-stone-400">
-                Belum ada riwayat setoran.
-              </div>
-            ) : (
-              <div className="bg-white rounded-xl border border-stone-100 divide-y divide-stone-50">
-                {sorted.map((t) => (
-                  <div key={t.id} className="px-4 py-3 flex items-center justify-between">
-                    <div>
-                      <p className="text-sm text-stone-800">{formatDate(t.date)}</p>
-                      {t.note && <p className="text-xs text-stone-400">{t.note}</p>}
-                    </div>
-                    <p className={`text-sm font-medium ${t.type === 'tarik' ? 'text-red-500' : 'text-blue-600'}`}>
-                      {t.type === 'tarik' ? '-' : '+'}{formatRupiah(t.amount)}
-                    </p>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {myConfirmations.length > 0 && (
+          {/* ── RIWAYAT KONFIRMASI ── */}
+          {menuTab === 'konfirmasi' && (
             <div>
-              <h2 className="text-sm font-medium text-stone-700 mb-2 flex items-center gap-1.5"><Inbox size={15} /> Riwayat Konfirmasi Pembayaran</h2>
-              <div className="bg-white rounded-xl border border-stone-100 divide-y divide-stone-50">
-                {myConfirmations.map((c) => (
-                  <div key={c.id} className="px-4 py-3 flex items-center justify-between gap-2">
-                    <div>
-                      <p className="text-sm text-stone-800">{formatDate(c.date)}</p>
-                      <p className="text-xs text-stone-400">{formatRupiah(c.amount)}{c.note ? ` · ${c.note}` : ''}</p>
-                    </div>
-                    <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${statusBadge[c.status]?.cls || 'bg-stone-100 text-stone-500'}`}>
-                      {statusBadge[c.status]?.label || c.status}
-                    </span>
-                  </div>
-                ))}
+              <div className="flex items-center justify-between mb-2">
+                <h2 className="text-sm font-medium text-stone-700 flex items-center gap-1.5"><Inbox size={15}/> Riwayat Konfirmasi</h2>
+                <button
+                  onClick={() => setShowConfirm(true)}
+                  className="flex items-center gap-1 px-3 py-1.5 rounded-xl bg-blue-600 text-white text-xs font-medium hover:bg-blue-700 transition"
+                >
+                  <Plus size={13}/> Konfirmasi Baru
+                </button>
               </div>
+              {myConfirmations.length === 0 ? (
+                <div className="bg-white rounded-xl border border-stone-100 p-8 text-center space-y-3">
+                  <p className="text-sm text-stone-400">Belum ada riwayat konfirmasi pembayaran.</p>
+                  <button
+                    onClick={() => setShowConfirm(true)}
+                    className="mx-auto flex items-center gap-2 px-4 py-2 rounded-xl bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 transition"
+                  >
+                    <MessageCircle size={15}/> Konfirmasi Sekarang
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {myConfirmations.map((c) => {
+                    const badge = statusBadge[c.status] || { label: c.status, cls: 'bg-stone-100 text-stone-500' };
+                    return (
+                      <div key={c.id} className="bg-white rounded-xl border border-stone-100 p-4 space-y-2">
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <p className="text-sm font-medium text-stone-800">{formatRupiah(c.amount)}</p>
+                            <p className="text-xs text-stone-400">{formatDate(c.date)}</p>
+                          </div>
+                          <span className={`text-xs px-2.5 py-1 rounded-full shrink-0 font-medium ${badge.cls}`}>{badge.label}</span>
+                        </div>
+                        {c.proofImage && (
+                          <img
+                            src={c.proofImage}
+                            alt="Bukti transfer"
+                            onClick={() => window.open(c.proofImage, '_blank')}
+                            className="max-h-40 rounded-lg border border-stone-200 cursor-zoom-in w-auto"
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── AKUN ── */}
+          {menuTab === 'akun' && (
+            <div className="space-y-4">
+              {/* Info pribadi */}
+              <div className="bg-white rounded-xl border border-stone-100 p-4 space-y-2">
+                <h3 className="text-sm font-medium text-stone-700 mb-3">Informasi Akun</h3>
+                <div className="flex justify-between text-sm">
+                  <span className="text-stone-400">Nama</span>
+                  <span className="text-stone-800 font-medium">{member.name}</span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-stone-400">No. HP</span>
+                  <span className="text-stone-800">{member.phone}</span>
+                </div>
+                {animal && (
+                  <div className="flex justify-between text-sm">
+                    <span className="text-stone-400">Hewan Qurban</span>
+                    <span className="text-stone-800">{animalEmoji(animal.name)} {animal.name}</span>
+                  </div>
+                )}
+                <div className="flex justify-between text-sm">
+                  <span className="text-stone-400">Target</span>
+                  <span className="text-stone-800">{formatRupiah(target)}</span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-stone-400">Terdaftar</span>
+                  <span className="text-stone-800">{member.joinDate ? formatDate(member.joinDate) : '-'}</span>
+                </div>
+              </div>
+
+              {/* Ganti PIN */}
+              <div className="bg-white rounded-xl border border-stone-100 p-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium text-stone-800">Ganti PIN</p>
+                    <p className="text-xs text-stone-400 mt-0.5">Ubah PIN login akun Anda</p>
+                  </div>
+                  <button
+                    onClick={() => setShowChangePin(true)}
+                    className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 transition"
+                  >
+                    <KeyRound size={15}/> Ganti PIN
+                  </button>
+                </div>
+              </div>
+
+              {/* Keluar */}
+              <button
+                onClick={onLogout}
+                className="w-full py-3 rounded-xl bg-white border border-red-100 text-red-500 text-sm font-medium flex items-center justify-center gap-2 hover:bg-red-50 transition"
+              >
+                <LogOut size={16}/> Keluar dari Akun
+              </button>
             </div>
           )}
         </main>
+
+        {/* Bottom navigation */}
+        <nav className="fixed bottom-0 inset-x-0 bg-white border-t border-stone-100 flex z-20 shadow-[0_-2px_12px_rgba(0,0,0,0.05)]">
+          {navItems.map((item) => (
+            <button
+              key={item.key}
+              onClick={() => setMenuTab(item.key)}
+              className={`flex-1 flex flex-col items-center py-2.5 gap-0.5 relative transition-colors ${menuTab === item.key ? 'text-blue-600' : 'text-stone-400 hover:text-stone-600'}`}
+            >
+              <div className="relative">
+                <item.icon size={20}/>
+                {!!item.badge && (
+                  <span className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-red-500 text-white text-[10px] flex items-center justify-center leading-none font-medium">
+                    {item.badge}
+                  </span>
+                )}
+              </div>
+              <span className="text-[11px] font-medium">{item.label}</span>
+              {menuTab === item.key && <span className="absolute top-0 inset-x-0 h-0.5 bg-blue-600 rounded-b-full"/>}
+            </button>
+          ))}
+        </nav>
       </div>
 
+      {/* Modals */}
       {showConfirm && (
         <PaymentConfirmModal
           member={{ ...member, id: memberId }}
@@ -1059,8 +1482,15 @@ function MemberDashboard({ memberId, member, transactions, balance, settings, co
           onSubmit={onSubmitConfirmation}
         />
       )}
+      {showChangePin && (
+        <ChangePinModal
+          member={member}
+          onClose={() => setShowChangePin(false)}
+          onSave={onChangePin}
+        />
+      )}
 
-      <PersonalPrintReport settings={settings} member={member} transactions={transactions} balance={balance} />
+      <PersonalPrintReport settings={settings} member={member} transactions={transactions} balance={balance}/>
     </div>
   );
 }
@@ -1223,7 +1653,7 @@ function SettingsPanel({ settings, persistSettings }) {
   );
 }
 
-function AdminDashboard({ members, transactions, settings, confirmations, balanceFor, persistMembers, persistTransactions, persistSettings, persistConfirmations, onLogout }) {
+function AdminDashboard({ members, transactions, settings, confirmations, groupOverrides, balanceFor, persistMembers, persistTransactions, persistSettings, persistConfirmations, persistGroupOverrides, onLogout }) {
   const [tab, setTab] = useState('overview');
   const [search, setSearch] = useState('');
   const [showAddMember, setShowAddMember] = useState(false);
@@ -1233,15 +1663,27 @@ function AdminDashboard({ members, transactions, settings, confirmations, balanc
   const [resetPinFor, setResetPinFor] = useState(null);
   const [confirmDeleteConfirmation, setConfirmDeleteConfirmation] = useState(null);
   const [printTarget, setPrintTarget] = useState(null);
+  const [editGroupFor, setEditGroupFor] = useState(null); // animalId
 
   const memberList = Object.entries(members).map(([id, m]) => ({ id, ...m, balance: balanceFor(id) }));
   const filtered = memberList.filter((m) => m.name.toLowerCase().includes(search.toLowerCase()) || m.phone.includes(search));
   const totalSaved = memberList.reduce((s, m) => s + m.balance, 0);
-  const groupData = computeGroups(members, settings);
+  const groupData = computeGroups(members, settings, groupOverrides || {});
   const pendingConfirmations = (confirmations || []).filter((c) => c.status === 'pending');
   const sortedConfirmations = [...(confirmations || [])].sort((a, b) => b.createdAt - a.createdAt);
   const orphanConfirmations = sortedConfirmations.filter((c) => !members[c.memberId]);
   const financeReport = computeFinanceReport(members, transactions, settings, balanceFor);
+
+  async function saveGroupOverride(animalId, data) {
+    const next = { ...(groupOverrides || {}) };
+    if (data === null) {
+      delete next[animalId]; // reset to auto
+    } else {
+      next[animalId] = data;
+    }
+    await persistGroupOverrides(next);
+    setEditGroupFor(null);
+  }
 
   useEffect(() => {
     if (!printTarget) return;
@@ -1445,29 +1887,41 @@ function AdminDashboard({ members, transactions, settings, confirmations, balanc
           <div className="space-y-4">
             {groupData.length === 0 && (
               <div className="bg-white rounded-xl border border-stone-100 p-6 text-center text-sm text-stone-400">
-                Belum ada jenis hewan dengan kuota patungan ({'>'}1). Atur kuota di tab Pengaturan → Jenis Hewan Qurban.
+                Belum ada jenis hewan dengan kuota patungan ({'>'} 1). Atur kuota di tab Pengaturan → Jenis Hewan Qurban.
               </div>
             )}
-            {groupData.map(({ type, groups }) => (
+            {groupData.map(({ type, groups, unassigned, isManual }) => (
               <div key={type.id} className="bg-white rounded-xl border border-stone-100 p-4 space-y-3">
                 <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-medium text-stone-700 flex items-center gap-1.5">
-                    <span>{animalEmoji(type.name)}</span> {type.name}
-                  </h3>
-                  <span className="text-xs text-stone-400">Kuota {type.quota} orang/ekor</span>
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-sm font-medium text-stone-700 flex items-center gap-1.5">
+                      <span>{animalEmoji(type.name)}</span> {type.name}
+                    </h3>
+                    <span className={`text-xs px-2 py-0.5 rounded-full ${isManual ? 'bg-blue-100 text-blue-600' : 'bg-stone-100 text-stone-500'}`}>
+                      {isManual ? 'Manual' : 'Otomatis'}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => setEditGroupFor(type.id)}
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-blue-50 text-blue-600 text-xs font-medium hover:bg-blue-100 transition"
+                  >
+                    <Edit2 size={12}/> Edit Kelompok
+                  </button>
                 </div>
+
                 {groups.length === 0 ? (
                   <p className="text-sm text-stone-400">Belum ada Shohibul Qurban yang memilih hewan ini.</p>
                 ) : (
                   <div className="space-y-3">
                     {groups.map((g, idx) => {
+                      const name = (groupOverrides?.[type.id]?.names?.[idx]) || `Kelompok ${idx + 1}`;
                       const isFull = g.length >= type.quota;
                       const totalGroupSaved = g.reduce((s, m) => s + balanceFor(m.id), 0);
                       const totalGroupTarget = type.price * type.quota;
                       return (
                         <div key={idx} className="border border-stone-100 rounded-xl p-3">
                           <div className="flex items-center justify-between mb-2">
-                            <p className="text-sm font-medium text-stone-800">Kelompok {idx + 1}</p>
+                            <p className="text-sm font-medium text-stone-800">{name}</p>
                             <span className={`text-xs px-2 py-0.5 rounded-full ${isFull ? 'bg-blue-100 text-blue-700' : 'bg-amber-100 text-amber-700'}`}>
                               {g.length}/{type.quota} orang{isFull ? ' · Lengkap' : ` · Kurang ${type.quota - g.length}`}
                             </span>
@@ -1481,13 +1935,27 @@ function AdminDashboard({ members, transactions, settings, confirmations, balanc
                             ))}
                           </ul>
                           <div className="text-xs text-stone-400 pt-1 border-t border-stone-50">
-                            Total terkumpul kelompok: {formatRupiah(totalGroupSaved)} / {formatRupiah(totalGroupTarget)}
+                            Total terkumpul: {formatRupiah(totalGroupSaved)} / {formatRupiah(totalGroupTarget)}
                           </div>
                         </div>
                       );
                     })}
                   </div>
                 )}
+
+                {/* Unassigned members in manual mode */}
+                {isManual && unassigned.length > 0 && (
+                  <div className="border border-dashed border-amber-200 bg-amber-50 rounded-xl p-3">
+                    <p className="text-xs font-medium text-amber-700 mb-1.5">Belum dikelompokkan ({unassigned.length} orang):</p>
+                    <div className="flex flex-wrap gap-1">
+                      {unassigned.map((m) => (
+                        <span key={m.id} className="text-xs px-2 py-0.5 rounded-full bg-white border border-amber-200 text-amber-700">{m.name}</span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="text-xs text-stone-400">Kuota {type.quota} orang/ekor</div>
               </div>
             ))}
           </div>
@@ -1614,16 +2082,18 @@ export default function App() {
   const [transactions, setTransactions] = useState([]);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [confirmations, setConfirmations] = useState([]);
+  const [groupOverrides, setGroupOverrides] = useState({});
   const [session, setSession] = useState(null);
 
   useEffect(() => {
     (async () => {
       try {
-        const [m, t, s, c] = await Promise.all([
+        const [m, t, s, c, g] = await Promise.all([
           safeGet(STORAGE_KEYS.MEMBERS, true),
           safeGet(STORAGE_KEYS.TRANSACTIONS, true),
           safeGet(STORAGE_KEYS.SETTINGS, true),
           safeGet(STORAGE_KEYS.CONFIRMATIONS, true),
+          safeGet(STORAGE_KEYS.GROUP_OVERRIDES, true),
         ]);
         if (m) setMembers(JSON.parse(m.value));
         if (t) setTransactions(JSON.parse(t.value));
@@ -1632,6 +2102,7 @@ export default function App() {
           try { await window.storage.set(STORAGE_KEYS.SETTINGS, JSON.stringify(DEFAULT_SETTINGS), true); } catch {}
         }
         if (c) setConfirmations(JSON.parse(c.value));
+        if (g) setGroupOverrides(JSON.parse(g.value));
       } catch (e) {
         console.error(e);
       } finally {
@@ -1655,6 +2126,10 @@ export default function App() {
   async function persistConfirmations(next) {
     setConfirmations(next);
     try { await window.storage.set(STORAGE_KEYS.CONFIRMATIONS, JSON.stringify(next), true); } catch (e) { console.error(e); }
+  }
+  async function persistGroupOverrides(next) {
+    setGroupOverrides(next);
+    try { await window.storage.set(STORAGE_KEYS.GROUP_OVERRIDES, JSON.stringify(next), true); } catch (e) { console.error(e); }
   }
   async function addConfirmation(conf) {
     await persistConfirmations([...confirmations, conf]);
@@ -1685,11 +2160,13 @@ export default function App() {
         transactions={transactions}
         settings={settings}
         confirmations={confirmations}
+        groupOverrides={groupOverrides}
         balanceFor={balanceFor}
         persistMembers={persistMembers}
         persistTransactions={persistTransactions}
         persistSettings={persistSettings}
         persistConfirmations={persistConfirmations}
+        persistGroupOverrides={persistGroupOverrides}
         onLogout={() => setSession(null)}
       />
     );
@@ -1710,6 +2187,9 @@ export default function App() {
       settings={settings}
       confirmations={confirmations.filter((c) => c.memberId === session.id)}
       onSubmitConfirmation={addConfirmation}
+      onChangePin={async (newPin) => {
+        await persistMembers({ ...members, [session.id]: { ...members[session.id], pin: newPin } });
+      }}
       onLogout={() => setSession(null)}
     />
   );
