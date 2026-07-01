@@ -798,6 +798,227 @@ function ConfirmModal({ message, onCancel, onConfirm }) {
   );
 }
 
+function EditGroupModal({ animalType, members, currentOverride, balanceFor, onClose, onSave }) {
+  // Initialise state from existing override or auto-layout
+  const allForType = Object.entries(members)
+    .filter(([, m]) => m.animalId === animalType.id)
+    .map(([id, m]) => ({ id, ...m }))
+    .sort((a, b) => (a.joinDate || '').localeCompare(b.joinDate || '') || a.id.localeCompare(b.id));
+
+  const buildInitialGroups = () => {
+    if (currentOverride?.groups) {
+      return currentOverride.groups.map((grp) => grp.filter((id) => members[id]));
+    }
+    const quota = animalType.quota || 7;
+    const result = [];
+    for (let i = 0; i < allForType.length; i += quota) {
+      result.push(allForType.slice(i, i + quota).map((m) => m.id));
+    }
+    if (result.length === 0) result.push([]);
+    return result;
+  };
+
+  const buildInitialNames = (groups) => {
+    if (currentOverride?.names) {
+      const names = [...currentOverride.names];
+      while (names.length < groups.length) names.push(`Kelompok ${names.length + 1}`);
+      return names;
+    }
+    return groups.map((_, i) => `Kelompok ${i + 1}`);
+  };
+
+  const initGroups = buildInitialGroups();
+  const [groups, setGroups] = useState(initGroups);
+  const [names, setNames] = useState(buildInitialNames(initGroups));
+
+  const assignedIds = new Set(groups.flat());
+  const unassigned = allForType.filter((m) => !assignedIds.has(m.id));
+
+  function updateName(idx, val) {
+    setNames((prev) => prev.map((n, i) => (i === idx ? val : n)));
+  }
+  function addGroup() {
+    setGroups((prev) => [...prev, []]);
+    setNames((prev) => [...prev, `Kelompok ${prev.length + 1}`]);
+  }
+  function deleteGroup(idx) {
+    setGroups((prev) => prev.filter((_, i) => i !== idx));
+    setNames((prev) => prev.filter((_, i) => i !== idx));
+  }
+  function removeMember(groupIdx, memberId) {
+    setGroups((prev) => prev.map((g, i) => i === groupIdx ? g.filter((id) => id !== memberId) : g));
+  }
+  function addMemberToGroup(groupIdx, memberId) {
+    if (!memberId) return;
+    setGroups((prev) => prev.map((g, i) => i === groupIdx ? [...g, memberId] : g));
+  }
+  function moveMember(fromGroup, memberId, toGroup) {
+    const to = parseInt(toGroup, 10);
+    setGroups((prev) => prev.map((g, i) => {
+      if (i === fromGroup) return g.filter((id) => id !== memberId);
+      if (i === to) return [...g, memberId];
+      return g;
+    }));
+  }
+  function handleSave() {
+    onSave({ groups, names });
+  }
+  function handleReset() {
+    onSave(null);
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-end sm:items-center justify-center z-50 p-0 sm:p-4">
+      <div className="bg-white rounded-t-2xl sm:rounded-2xl w-full sm:max-w-lg max-h-[92vh] flex flex-col shadow-xl">
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-stone-100 shrink-0">
+          <div>
+            <h3 className="font-semibold text-stone-900" style={headFont}>Edit Kelompok</h3>
+            <p className="text-xs text-stone-400 mt-0.5">{animalEmoji(animalType.name)} {animalType.name} · kuota {animalType.quota} orang/ekor</p>
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-stone-100 text-stone-400"><X size={18}/></button>
+        </div>
+
+        {/* Body */}
+        <div className="overflow-y-auto flex-1 px-5 py-4 space-y-4">
+          {/* Unassigned pool */}
+          {unassigned.length > 0 && (
+            <div className="bg-amber-50 border border-amber-200 rounded-xl p-3">
+              <p className="text-xs font-medium text-amber-700 mb-2">Belum dikelompokkan ({unassigned.length} orang) — pilih kelompok tujuan di baris anggota</p>
+              <div className="space-y-1">
+                {unassigned.map((m) => {
+                  const [sel, setSel] = useState('');
+                  return (
+                    <div key={m.id} className="flex items-center gap-2">
+                      <span className="text-sm text-stone-700 flex-1 truncate">{m.name}</span>
+                      <select
+                        value={sel}
+                        onChange={(e) => { addMemberToGroup(parseInt(e.target.value, 10), m.id); setSel(''); }}
+                        className="text-xs border border-amber-200 rounded-lg px-2 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      >
+                        <option value="">Masukkan ke...</option>
+                        {groups.map((_, i) => (
+                          <option key={i} value={i}>{names[i] || `Kelompok ${i + 1}`}</option>
+                        ))}
+                      </select>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Groups */}
+          {groups.map((grp, idx) => {
+            const isFull = grp.length >= animalType.quota;
+            const otherGroups = groups.map((_, i) => i).filter((i) => i !== idx);
+            return (
+              <div key={idx} className="border border-stone-200 rounded-xl overflow-hidden">
+                {/* Group header */}
+                <div className={`flex items-center gap-2 px-3 py-2 ${isFull ? 'bg-blue-50' : 'bg-stone-50'}`}>
+                  <input
+                    value={names[idx] || ''}
+                    onChange={(e) => updateName(idx, e.target.value)}
+                    className="flex-1 text-sm font-medium bg-transparent border-none outline-none text-stone-800 placeholder-stone-400"
+                    placeholder={`Kelompok ${idx + 1}`}
+                  />
+                  <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${isFull ? 'bg-blue-100 text-blue-700' : 'bg-stone-200 text-stone-500'}`}>
+                    {grp.length}/{animalType.quota}
+                  </span>
+                  <button
+                    onClick={() => deleteGroup(idx)}
+                    title="Hapus kelompok"
+                    className="p-1 rounded-lg hover:bg-red-50 text-stone-300 hover:text-red-400 transition"
+                  >
+                    <Trash2 size={13}/>
+                  </button>
+                </div>
+
+                {/* Members */}
+                <div className="divide-y divide-stone-50">
+                  {grp.length === 0 && (
+                    <p className="px-3 py-3 text-xs text-stone-400 italic">Kelompok kosong — tambahkan anggota dari pool di atas.</p>
+                  )}
+                  {grp.map((mId) => {
+                    const m = members[mId];
+                    if (!m) return null;
+                    return (
+                      <div key={mId} className="px-3 py-2 flex items-center gap-2">
+                        <span className="flex-1 text-sm text-stone-700 truncate">{m.name}</span>
+                        <span className="text-xs text-stone-400 shrink-0">{formatRupiah(balanceFor(mId))}</span>
+                        {/* Move to another group */}
+                        {otherGroups.length > 0 && (
+                          <select
+                            defaultValue=""
+                            onChange={(e) => { if (e.target.value !== '') moveMember(idx, mId, e.target.value); e.target.value = ''; }}
+                            className="text-xs border border-stone-200 rounded-lg px-1.5 py-1 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                          >
+                            <option value="">Pindah ke...</option>
+                            {otherGroups.map((i) => (
+                              <option key={i} value={i}>{names[i] || `Kelompok ${i + 1}`}</option>
+                            ))}
+                          </select>
+                        )}
+                        <button
+                          onClick={() => removeMember(idx, mId)}
+                          title="Keluarkan dari kelompok"
+                          className="p-1 rounded-lg hover:bg-red-50 text-stone-300 hover:text-red-400 transition"
+                        >
+                          <X size={13}/>
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Add from unassigned inline */}
+                {unassigned.length > 0 && !isFull && (
+                  <div className="px-3 pb-2">
+                    <select
+                      defaultValue=""
+                      onChange={(e) => { if (e.target.value) { addMemberToGroup(idx, e.target.value); } e.target.value=''; }}
+                      className="w-full text-xs border border-dashed border-stone-200 rounded-lg px-2 py-1.5 text-stone-400 focus:outline-none focus:ring-1 focus:ring-blue-500 bg-stone-50"
+                    >
+                      <option value="">+ Tambahkan anggota ke kelompok ini...</option>
+                      {unassigned.map((m) => (
+                        <option key={m.id} value={m.id}>{m.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          {/* Add group button */}
+          <button
+            onClick={addGroup}
+            className="w-full py-2.5 rounded-xl border border-dashed border-blue-300 text-blue-600 text-sm font-medium flex items-center justify-center gap-1.5 hover:bg-blue-50 transition"
+          >
+            <Plus size={15}/> Tambah Kelompok Baru
+          </button>
+        </div>
+
+        {/* Footer */}
+        <div className="px-5 py-4 border-t border-stone-100 flex gap-2 shrink-0">
+          <button
+            onClick={handleReset}
+            className="px-3 py-2.5 rounded-xl bg-stone-100 text-stone-600 text-sm font-medium hover:bg-stone-200 transition"
+          >
+            Reset Otomatis
+          </button>
+          <button
+            onClick={handleSave}
+            className="flex-1 py-2.5 rounded-xl bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 transition"
+          >
+            Simpan Kelompok
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ResetPinModal({ memberName, onClose, onSave }) {
   const [newPin, setNewPin] = useState('');
   const [confirmPin, setConfirmPin] = useState('');
@@ -1663,7 +1884,9 @@ function AdminDashboard({ members, transactions, settings, confirmations, groupO
   const [resetPinFor, setResetPinFor] = useState(null);
   const [confirmDeleteConfirmation, setConfirmDeleteConfirmation] = useState(null);
   const [printTarget, setPrintTarget] = useState(null);
-  const [editGroupFor, setEditGroupFor] = useState(null); // animalId
+  const [editGroupFor, setEditGroupFor] = useState(null);
+  const [editingGroupName, setEditingGroupName] = useState(null); // { typeId, groupIdx }
+  const [editingGroupNameValue, setEditingGroupNameValue] = useState('');
 
   const memberList = Object.entries(members).map(([id, m]) => ({ id, ...m, balance: balanceFor(id) }));
   const filtered = memberList.filter((m) => m.name.toLowerCase().includes(search.toLowerCase()) || m.phone.includes(search));
@@ -1673,6 +1896,52 @@ function AdminDashboard({ members, transactions, settings, confirmations, groupO
   const sortedConfirmations = [...(confirmations || [])].sort((a, b) => b.createdAt - a.createdAt);
   const orphanConfirmations = sortedConfirmations.filter((c) => !members[c.memberId]);
   const financeReport = computeFinanceReport(members, transactions, settings, balanceFor);
+
+  // Build override from current state (auto → manual if needed) and apply a mutation fn
+  function mutateGroupOverride(animalId, mutateFn) {
+    const type = (settings.animalTypes || []).find((a) => a.id === animalId);
+    if (!type) return;
+    const cur = groupOverrides?.[animalId];
+    // If no manual override yet, build from auto layout first
+    let groups, names;
+    if (cur?.groups) {
+      groups = cur.groups.map((g) => [...g]);
+      names = [...(cur.names || groups.map((_, i) => `Kelompok ${i + 1}`))];
+    } else {
+      const allForType = Object.entries(members)
+        .filter(([, m]) => m.animalId === animalId)
+        .map(([id]) => id)
+        .sort();
+      const quota = type.quota || 7;
+      groups = [];
+      for (let i = 0; i < allForType.length; i += quota) groups.push(allForType.slice(i, i + quota));
+      if (groups.length === 0) groups.push([]);
+      names = groups.map((_, i) => `Kelompok ${i + 1}`);
+    }
+    mutateFn(groups, names);
+    const next = { ...(groupOverrides || {}), [animalId]: { groups, names } };
+    persistGroupOverrides(next);
+  }
+
+  function addGroupDirectly(animalId) {
+    mutateGroupOverride(animalId, (groups, names) => {
+      groups.push([]);
+      names.push(`Kelompok ${groups.length}`);
+    });
+  }
+
+  function saveGroupNameInline(typeId, groupIdx, newName) {
+    mutateGroupOverride(typeId, (groups, names) => {
+      while (names.length <= groupIdx) names.push(`Kelompok ${names.length + 1}`);
+      names[groupIdx] = newName.trim() || `Kelompok ${groupIdx + 1}`;
+    });
+    setEditingGroupName(null);
+  }
+
+  function startEditGroupName(typeId, groupIdx, currentName) {
+    setEditingGroupName({ typeId, groupIdx });
+    setEditingGroupNameValue(currentName);
+  }
 
   async function saveGroupOverride(animalId, data) {
     const next = { ...(groupOverrides || {}) };
@@ -1892,6 +2161,7 @@ function AdminDashboard({ members, transactions, settings, confirmations, groupO
             )}
             {groupData.map(({ type, groups, unassigned, isManual }) => (
               <div key={type.id} className="bg-white rounded-xl border border-stone-100 p-4 space-y-3">
+                {/* Animal type header */}
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <h3 className="text-sm font-medium text-stone-700 flex items-center gap-1.5">
@@ -1905,37 +2175,79 @@ function AdminDashboard({ members, transactions, settings, confirmations, groupO
                     onClick={() => setEditGroupFor(type.id)}
                     className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-blue-50 text-blue-600 text-xs font-medium hover:bg-blue-100 transition"
                   >
-                    <Edit2 size={12}/> Edit Kelompok
+                    <Edit2 size={12}/> Atur Anggota
                   </button>
                 </div>
 
+                {/* Group cards */}
                 {groups.length === 0 ? (
                   <p className="text-sm text-stone-400">Belum ada Shohibul Qurban yang memilih hewan ini.</p>
                 ) : (
-                  <div className="space-y-3">
+                  <div className="space-y-2">
                     {groups.map((g, idx) => {
-                      const name = (groupOverrides?.[type.id]?.names?.[idx]) || `Kelompok ${idx + 1}`;
+                      const currentName = (groupOverrides?.[type.id]?.names?.[idx]) || `Kelompok ${idx + 1}`;
+                      const isEditingThis = editingGroupName?.typeId === type.id && editingGroupName?.groupIdx === idx;
                       const isFull = g.length >= type.quota;
                       const totalGroupSaved = g.reduce((s, m) => s + balanceFor(m.id), 0);
                       const totalGroupTarget = type.price * type.quota;
                       return (
-                        <div key={idx} className="border border-stone-100 rounded-xl p-3">
-                          <div className="flex items-center justify-between mb-2">
-                            <p className="text-sm font-medium text-stone-800">{name}</p>
-                            <span className={`text-xs px-2 py-0.5 rounded-full ${isFull ? 'bg-blue-100 text-blue-700' : 'bg-amber-100 text-amber-700'}`}>
-                              {g.length}/{type.quota} orang{isFull ? ' · Lengkap' : ` · Kurang ${type.quota - g.length}`}
+                        <div key={idx} className="border border-stone-100 rounded-xl overflow-hidden">
+                          {/* Group header with inline name edit */}
+                          <div className={`flex items-center gap-2 px-3 py-2 ${isFull ? 'bg-blue-50' : 'bg-stone-50'}`}>
+                            {isEditingThis ? (
+                              <form
+                                className="flex-1 flex items-center gap-1.5"
+                                onSubmit={(e) => { e.preventDefault(); saveGroupNameInline(type.id, idx, editingGroupNameValue); }}
+                              >
+                                <input
+                                  autoFocus
+                                  value={editingGroupNameValue}
+                                  onChange={(e) => setEditingGroupNameValue(e.target.value)}
+                                  onBlur={() => saveGroupNameInline(type.id, idx, editingGroupNameValue)}
+                                  className="flex-1 text-sm font-medium bg-white border border-blue-300 rounded-lg px-2 py-0.5 outline-none focus:ring-2 focus:ring-blue-500 text-stone-800"
+                                />
+                                <button type="submit" className="p-1 rounded-lg bg-blue-600 text-white hover:bg-blue-700">
+                                  <CheckCircle2 size={13}/>
+                                </button>
+                                <button type="button" onClick={() => setEditingGroupName(null)} className="p-1 rounded-lg hover:bg-stone-200 text-stone-400">
+                                  <X size={13}/>
+                                </button>
+                              </form>
+                            ) : (
+                              <>
+                                <button
+                                  onClick={() => startEditGroupName(type.id, idx, currentName)}
+                                  className="flex-1 text-left flex items-center gap-1.5 group"
+                                  title="Klik untuk ganti nama kelompok"
+                                >
+                                  <span className="text-sm font-medium text-stone-800">{currentName}</span>
+                                  <Edit2 size={11} className="text-stone-300 group-hover:text-blue-500 transition shrink-0"/>
+                                </button>
+                              </>
+                            )}
+                            <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${isFull ? 'bg-blue-100 text-blue-700' : 'bg-amber-100 text-amber-700'}`}>
+                              {g.length}/{type.quota}{isFull ? ' · Lengkap' : ` · Kurang ${type.quota - g.length}`}
                             </span>
                           </div>
-                          <ul className="space-y-1 mb-2">
-                            {g.map((m) => (
-                              <li key={m.id} className="text-sm text-stone-600 flex items-center justify-between">
-                                <span>{m.name}</span>
-                                <span className="text-stone-400">{formatRupiah(balanceFor(m.id))}</span>
-                              </li>
-                            ))}
-                          </ul>
-                          <div className="text-xs text-stone-400 pt-1 border-t border-stone-50">
-                            Total terkumpul: {formatRupiah(totalGroupSaved)} / {formatRupiah(totalGroupTarget)}
+
+                          {/* Members list */}
+                          <div className="px-3 py-2">
+                            {g.length === 0 ? (
+                              <p className="text-xs text-stone-400 italic py-1">Kelompok kosong — tambahkan anggota lewat tombol "Atur Anggota".</p>
+                            ) : (
+                              <ul className="space-y-1">
+                                {g.map((m) => (
+                                  <li key={m.id} className="text-sm text-stone-600 flex items-center justify-between py-0.5">
+                                    <span>{m.name}</span>
+                                    <span className="text-stone-400 text-xs">{formatRupiah(balanceFor(m.id))}</span>
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
+                            <div className="text-xs text-stone-400 pt-2 mt-1 border-t border-stone-50 flex justify-between">
+                              <span>Total terkumpul</span>
+                              <span>{formatRupiah(totalGroupSaved)} / {formatRupiah(totalGroupTarget)}</span>
+                            </div>
                           </div>
                         </div>
                       );
@@ -1955,7 +2267,25 @@ function AdminDashboard({ members, transactions, settings, confirmations, groupO
                   </div>
                 )}
 
-                <div className="text-xs text-stone-400">Kuota {type.quota} orang/ekor</div>
+                {/* Add Group + Reset buttons */}
+                <div className="flex gap-2 pt-1">
+                  <button
+                    onClick={() => addGroupDirectly(type.id)}
+                    className="flex-1 py-2 rounded-xl border border-dashed border-blue-300 text-blue-600 text-xs font-medium flex items-center justify-center gap-1.5 hover:bg-blue-50 transition"
+                  >
+                    <Plus size={13}/> Tambah Kelompok
+                  </button>
+                  {isManual && (
+                    <button
+                      onClick={() => saveGroupOverride(type.id, null)}
+                      className="px-3 py-2 rounded-xl border border-stone-200 text-stone-500 text-xs font-medium hover:bg-stone-50 transition"
+                    >
+                      Reset Otomatis
+                    </button>
+                  )}
+                </div>
+
+                <p className="text-xs text-stone-400">Kuota {type.quota} orang/ekor</p>
               </div>
             ))}
           </div>
@@ -2066,6 +2396,20 @@ function AdminDashboard({ members, transactions, settings, confirmations, groupO
           onConfirm={() => deleteMember(confirmDelete)}
         />
       )}
+      {editGroupFor && (() => {
+        const animalType = (settings.animalTypes || []).find((a) => a.id === editGroupFor);
+        if (!animalType) return null;
+        return (
+          <EditGroupModal
+            animalType={animalType}
+            members={members}
+            currentOverride={groupOverrides?.[editGroupFor]}
+            balanceFor={balanceFor}
+            onClose={() => setEditGroupFor(null)}
+            onSave={(data) => saveGroupOverride(editGroupFor, data)}
+          />
+        );
+      })()}
       </div>
 
       {printTarget === 'full' && (
